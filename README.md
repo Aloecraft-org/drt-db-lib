@@ -45,7 +45,8 @@ an honest 503, a crash, a retry — is the caller's decision, so there is no
 
 `M.new(deps)` takes exactly two, and a missing or wrong-typed one is a named
 failure at `new` rather than a nil call in the middle of a half-applied
-migration:
+migration — as is a `deps` that is not a table at all, which would otherwise
+surface as `attempt to index a number value`:
 
 | dep | required | contract |
 | --- | --- | --- |

@@ -165,6 +165,11 @@ local METHODS = {
 -- the middle of a half-applied migration.
 function M.new(deps)
   deps = deps or {}
+  -- Guard the table itself before reaching through it: new(42) would
+  -- otherwise raise "attempt to index a number value", which is the nil
+  -- dereference this constructor exists to turn into a sentence.
+  assert(type(deps) == 'table',
+    'db.new: deps must be a table of { db = <handle>, now = <fn () -> unix SECONDS> }')
   local db = deps.db
   assert(type(db) == 'table' or type(db) == 'userdata',
     'db.new: deps.db must be an open sql connector handle (this library never opens one)')
