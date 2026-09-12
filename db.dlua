@@ -1,0 +1,244 @@
+-- db -- the generic half of the drt sqlite connector: the migration runner,
+-- row naming, LIKE escaping, and the schema version.
+--
+-- Extracted from discofetch api/supervisor.lua. The arithmetic, the branch
+-- order and the refusal behaviour are unchanged; what was a file-level local
+-- reaching for a file-level `db` and `now` is an instance here, so two
+-- databases can be migrated from one program. Nothing discofetch-specific
+-- came along: the migration LIST and the database NAME belong to the program
+-- that owns the schema, and only the RUNNER is here.
+--
+-- ====================================================== the surface block
+--
+-- This library never opens a handle and never decides what a failed open
+-- means. It receives one. The two facts behind that split, carried from the
+-- database banner in supervisor.lua:
+--
+--   * `create = false` over there means a missing file is refused rather
+--     than conjured, which is the behaviour we want: a database has to be
+--     created out of band so WAL is set before the first open, and the
+--     authorizer denies PRAGMA to guests permanently, so a guest program
+--     could never fix it afterwards.
+--
+--   * `host.sql.open` is client-side sugar -- the name rides along in each
+--     call as args.db -- so it does not itself touch the disk. The refusal
+--     arrives on the first exec instead, which is why the caller opens and
+--     migrates inside ONE pcall and why the recorded error is the
+--     connector's own sentence. Deciding what to do with that sentence (an
+--     honest 503, a crash, a retry) is the caller's job, not this
+--     library's, which is why there is no db_ready here to capture.
+--
+-- THE CONNECTOR RULES every user of this library is obeying, gathered from
+-- the call sites rather than from any one of them:
+--
+--   * NO TRANSACTIONS. The authorizer denies BEGIN. A sequence of statements
+--     can stop half way and there is nothing to roll back, so multi-statement
+--     writes are ordered to survive being interrupted between any two of
+--     them, and a single statement is the only consistency available.
+--   * CHECK-AND-CLAIM, never SELECT-then-INSERT. Draw, insert, and let a
+--     PRIMARY KEY or a UNIQUE refuse the duplicate -- that constraint IS the
+--     atomicity. For an update, put the precondition in the WHERE and read
+--     `changes` to learn whether WE were the one who moved the row.
+--   * NIL BINDS ARE REFUSED OUTRIGHT ("SQL NULL is spelled NULL in the
+--     statement text"). An optional column is ABSENT FROM THE STATEMENT --
+--     built into the column list and the placeholders only when there is a
+--     value -- rather than bound as nil.
+--   * NO PRAGMA, ever. It is denied permanently, so nothing here can tune
+--     the file it was handed.
+--   * `db.try_exec` is the non-raising exec and is what check-and-claim is
+--     written against. migrate() below deliberately does NOT use it: it
+--     wraps its soft statements in pcall(db.exec, ...) so that the ONLY
+--     swallowed error in this library is the one the soft/hard discipline
+--     accounts for. That is a choice; it must not be tidied into a
+--     try_exec later on the grounds that they look alike.
+--
+-- 1. Entry points.
+--
+--      M.new{ db = <handle>, now = <fn () -> unix SECONDS> } -> instance
+--      instance:migrate(migrations) -> number of versions applied
+--      instance:schema_version()    -> the highest version applied, or 0
+--
+--      M.rows_by_name(q) -> array of name->value maps   (pure)
+--      M.like_escape(s)  -> s with the LIKE wildcards escaped   (pure)
+--      M.LIKE_ESCAPE_CHAR -- the character like_escape escapes WITH, so the
+--                            ESCAPE clause and the escaper cannot drift.
+--
+--    The two pure functions are plain fields because they touch neither the
+--    handle nor the clock. Everything that touches either arrives through
+--    new(), where a missing or wrong-typed dep is a named failure rather
+--    than a nil call on the first migration of a deployment.
+--
+--    The ownership ruling wrote these as M.migrate(db, migrations, now) and
+--    M.schema_version(db). They are the same two operations; the handle and
+--    the clock are named once at construction instead of at every call,
+--    because the module contract these nine libraries share requires
+--    anything reaching db or the clock to come through a constructor.
+--
+--    MIGRATIONS ARE STORED PRE-SPLIT: `migrations` is an array of
+--    { version = <n>, statements = { ... } }, and each statement is ONE
+--    statement. The connector prepares exactly one statement per call, so
+--    something has to do the splitting; doing it at runtime means stripping
+--    `--` comments and then splitting on `;`, which works until the first
+--    migration containing a semicolon or a double dash inside a string
+--    literal, and then cuts a statement in half silently. A Lua array has no
+--    such day. This library will not split a blob for you, on purpose.
+--
+--    The clock's contract is load-bearing: whole unix SECONDS. It is written
+--    into schema_migration.applied_at, which is a column the rest of the
+--    schema's timestamps are compared against.
+
+local M = {}
+
+-- Bodies are in the depth sections; a Lua local must precede its use, so the
+-- names are declared here and the METHODS table binds them.
+local migrate, schema_version
+
+-- 2. Configurable values.
+--
+-- The table name is spelled inside the four statements rather than
+-- interpolated from a constant, and it is deliberately NOT a parameter:
+-- schema_migration is where a deployment has ALREADY recorded what it
+-- applied, so a program that renamed it would re-run every migration from
+-- version 1 against a populated database.
+local BOOTSTRAP = [[CREATE TABLE IF NOT EXISTS schema_migration (
+      version    INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    ) STRICT]]
+
+local DONE    = 'SELECT version FROM schema_migration'
+local RECORD  = 'INSERT INTO schema_migration (version, applied_at) VALUES (?, ?)'
+local CURRENT = 'SELECT COALESCE(MAX(version), 0) FROM schema_migration'
+
+-- `%` and `_` are LIKE wildcards, so an unescaped search for "_" matches
+-- every row and reads as "search is broken". The pattern is still BOUND, not
+-- concatenated -- this is about correctness, not injection, and the two are
+-- worth keeping distinct in one's head.
+--
+-- The escape character is exported because the caller has to name it in the
+-- SQL (`... LIKE ? ESCAPE '\'`). Two spellings of one character is how a
+-- search silently stops escaping.
+local LIKE_WILDCARDS = '([%%_\\])'
+local LIKE_REPLACE   = '\\%1'
+M.LIKE_ESCAPE_CHAR   = '\\'
+
+-- 3. Fan-out.
+--
+-- A migration statement is one of exactly two kinds and this table is the
+-- whole of that decision, so a third kind would be a line here rather than
+-- an elseif inside the loop.
+--
+-- A statement is a string that MUST succeed, or { soft = '...' } that may
+-- fail. Soft exists for exactly one thing: `ALTER TABLE ... ADD COLUMN` has
+-- no IF NOT EXISTS form, and the version row is written only after every
+-- statement in a version succeeds -- so a version that stops half way
+-- re-runs its earlier statements, and a bare ALTER raises `duplicate column
+-- name` on the second pass. Measured against build11 and drt 0.5.0: ALTER is
+-- permitted by the authorizer, and it does raise on a re-run.
+--
+-- Soft swallows the error, which is the risk: an ALTER that failed because
+-- the TABLE was missing would be skipped as silently as one that failed
+-- because the column was already there. So every soft run MUST be followed
+-- by a HARD statement that names the columns -- a `SELECT ... LIMIT 0`
+-- raises when a column is absent, which turns "silently skipped" into
+-- "loudly wrong" at the one moment somebody can still fix it. That pairing
+-- is the migration list's obligation and this library cannot check it; it
+-- is written here because this is where a reader meets `soft`.
+local RUN = {
+  ['string'] = function (db, stmt) db.exec(stmt) end,
+  ['table']  = function (db, stmt) pcall(db.exec, stmt.soft) end,
+}
+
+-- Anything that is neither runs as a hard statement, exactly as the original
+-- `if type(stmt) == 'table' then ... else ... end` did: the connector gets
+-- it and the connector refuses it, which is a better error than one this
+-- library could invent about a statement it does not understand.
+local RUN_DEFAULT = RUN['string']
+
+-- Everything an instance answers to. new() binds exactly this table.
+local METHODS = {
+  migrate        = function (self, migrations) return migrate(self, migrations) end,
+  schema_version = function (self) return schema_version(self) end,
+}
+
+-- depth: construction. Every dep is checked here, naming the dep in the
+-- sentence, so a wrong one is a failure at new() rather than a nil call in
+-- the middle of a half-applied migration.
+function M.new(deps)
+  deps = deps or {}
+  local db = deps.db
+  assert(type(db) == 'table' or type(db) == 'userdata',
+    'db.new: deps.db must be an open sql connector handle (this library never opens one)')
+  assert(type(db.exec) == 'function',
+    'db.new: deps.db.exec must be a function -- deps.db is not a connector handle')
+  assert(type(db.query) == 'function',
+    'db.new: deps.db.query must be a function -- deps.db is not a connector handle')
+  assert(type(deps.now) == 'function',
+    'db.new: deps.now must be a function returning unix SECONDS')
+  return setmetatable({ db = db, now = deps.now }, { __index = METHODS })
+end
+
+-- depth: the migration runner.
+function migrate(self, migrations)
+  assert(type(migrations) == 'table',
+    'db:migrate: migrations must be an array of { version = n, statements = { ... } }')
+
+  local db = self.db
+
+  -- Bootstrap first: the runner cannot consult a table it has not created.
+  db.exec(BOOTSTRAP)
+
+  local done = {}
+  for _, r in ipairs(db.query(DONE).rows) do
+    done[r[1]] = true
+  end
+
+  local applied = 0
+  for i, m in ipairs(migrations) do
+    assert(type(m) == 'table' and type(m.version) == 'number'
+             and type(m.statements) == 'table',
+      'db:migrate: migrations[' .. i .. '] needs a numeric version and a statements array')
+    if not done[m.version] then
+      for _, stmt in ipairs(m.statements) do
+        local run = RUN[type(stmt)] or RUN_DEFAULT
+        run(db, stmt)
+      end
+      -- The version row goes in only after every statement succeeded. There
+      -- are no transactions -- the authorizer denies BEGIN -- so a migration
+      -- can stop half applied and there is nothing to roll back. Recording
+      -- the version last is what makes a re-run converge instead of skipping
+      -- the rest of a file it never finished.
+      db.exec(RECORD, m.version, self.now())
+      applied = applied + 1
+    end
+  end
+
+  return applied
+end
+
+-- depth: the one read of the table migrate() bootstraps. COALESCE because
+-- MAX over no rows is NULL, and the empty database is the first thing a
+-- fresh deployment reads.
+function schema_version(self)
+  return self.db.query(CURRENT).rows[1][1]
+end
+
+-- depth: the two pure helpers.
+
+-- A query's rows as name->value maps rather than as positional arrays.
+-- Positional indexing works right up until someone reorders the SELECT, and
+-- then it silently swaps two fields of the same type -- two timestamps, say.
+function M.rows_by_name(q)
+  local out = {}
+  for _, row in ipairs(q.rows) do
+    local m = {}
+    for i, name in ipairs(q.cols) do m[name] = row[i] end
+    out[#out + 1] = m
+  end
+  return out
+end
+
+function M.like_escape(s)
+  return (s:gsub(LIKE_WILDCARDS, LIKE_REPLACE))
+end
+
+return M

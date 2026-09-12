@@ -1,0 +1,375 @@
+-- Cases for db. M is defined by test/run.sh, which wraps the module in an
+-- IIFE and concatenates this file after it.
+--
+-- The connector is a fake that LOGS every call and can be told to raise on a
+-- named statement. That is the only way to assert the two things the runner
+-- exists for -- bootstrap first, version row last -- because both are claims
+-- about the ORDER of calls, not about their results.
+
+local fails = 0
+local function ok(c, m) if c then print("   ok   " .. m) else print("   FAIL " .. m); fails = fails + 1 end end
+
+-- There is no `os` inside the guest -- which is the point of deps.now.
+local function noop_clock() return 1700000000 end
+
+-- The statements the module is expected to send, spelled out here so that
+-- changing one in the module is a failing test rather than a quiet change to
+-- a deployment's migration bookkeeping.
+local BOOTSTRAP = [[CREATE TABLE IF NOT EXISTS schema_migration (
+      version    INTEGER PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    ) STRICT]]
+local DONE    = 'SELECT version FROM schema_migration'
+local RECORD  = 'INSERT INTO schema_migration (version, applied_at) VALUES (?, ?)'
+local CURRENT = 'SELECT COALESCE(MAX(version), 0) FROM schema_migration'
+
+-- A fake sql connector. `fail` is consulted on every exec and may return a
+-- sentence to raise with, so a soft statement and a hard one can be made to
+-- fail at the same point in the same list. Recorded versions live in the
+-- handle, so a second migrate() over the same handle sees what the first one
+-- wrote -- which is what makes the convergence case real.
+local function connector(fail)
+  local h = { log = {}, versions = {}, try_execs = 0 }
+  h.exec = function(sql, ...)
+    local binds = table.pack(...)
+    h.log[#h.log + 1] = { sql = sql, binds = binds }
+    local why = fail and fail(sql)
+    if why then error(why, 0) end
+    if sql == RECORD then h.versions[#h.versions + 1] = binds[1] end
+    return { changes = 1 }
+  end
+  h.query = function(sql, ...)
+    h.log[#h.log + 1] = { sql = sql, binds = table.pack(...) }
+    if sql == DONE then
+      local rows = {}
+      for _, v in ipairs(h.versions) do rows[#rows + 1] = { v } end
+      return { rows = rows, cols = { 'version' } }
+    elseif sql == CURRENT then
+      local max = 0
+      for _, v in ipairs(h.versions) do if v > max then max = v end end
+      return { rows = { { max } }, cols = { 'max' } }
+    end
+    error('the module sent an unexpected query: ' .. tostring(sql), 0)
+  end
+  -- The non-raising exec. migrate() must never reach for it; see the case
+  -- that counts these.
+  h.try_exec = function() h.try_execs = h.try_execs + 1; return nil end
+  return h
+end
+
+-- A hand-driven clock in whole unix SECONDS, counting its own calls so the
+-- cases can assert how often the runner consults it.
+local function clock(t0)
+  local c = { t = t0 or 1700000000, calls = 0 }
+  c.now = function() c.calls = c.calls + 1; return c.t end
+  return c
+end
+
+local function execs_of(h, sql)
+  local n = 0
+  for _, e in ipairs(h.log) do if e.sql == sql then n = n + 1 end end
+  return n
+end
+
+local function index_of(h, sql)
+  for i, e in ipairs(h.log) do if e.sql == sql then return i end end
+  return nil
+end
+
+-- ------------------------------------------------------- construction
+
+local made, err = pcall(M.new)
+ok(not made and type(err) == 'string' and err:find('deps.db', 1, true) ~= nil,
+   'new() with no deps fails by name, mentioning deps.db')
+
+made, err = pcall(M.new, { db = 'discofetch.sqlite', now = noop_clock })
+ok(not made and err:find('deps.db', 1, true) ~= nil,
+   'new{db = <a name>} is refused: this library takes a handle, it never opens one')
+
+made, err = pcall(M.new, { db = { query = function() end }, now = noop_clock })
+ok(not made and err:find('deps.db.exec', 1, true) ~= nil,
+   'a handle without exec fails at new(), naming deps.db.exec')
+
+made, err = pcall(M.new, { db = { exec = function() end }, now = noop_clock })
+ok(not made and err:find('deps.db.query', 1, true) ~= nil,
+   'a handle without query fails at new(), naming deps.db.query')
+
+made, err = pcall(M.new, { db = connector() })
+ok(not made and err:find('deps.now', 1, true) ~= nil,
+   'new() without a clock fails by name, mentioning deps.now')
+
+made, err = pcall(M.new, { db = connector(), now = 1700000000 })
+ok(not made and err:find('deps.now', 1, true) ~= nil,
+   'new{now = <a number>} fails by name rather than deferring a nil call')
+ok(not made and err:find('SECONDS', 1, true) ~= nil,
+   'the clock failure says SECONDS, because the unit is the contract')
+
+-- ------------------------------------------------------- bootstrap first
+
+local h = connector()
+local c = clock()
+local inst = M.new{ db = h, now = c.now }
+
+local applied = inst:migrate({})
+ok(applied == 0, 'an empty migration list applies nothing')
+ok(h.log[1] and h.log[1].sql == BOOTSTRAP,
+   'bootstrap first: schema_migration is created before anything else')
+ok(h.log[2] and h.log[2].sql == DONE,
+   'the done set is read immediately after the bootstrap, not before it')
+ok(c.calls == 0, 'nothing applied means the clock is never consulted')
+
+-- --------------------------------------------------- the applied ordering
+
+h, c = connector(), clock(1700000123)
+inst = M.new{ db = h, now = c.now }
+
+local MIGRATIONS = {
+  { version = 1, statements = { 'CREATE TABLE a (x INTEGER)', 'CREATE INDEX ai ON a (x)' } },
+  { version = 2, statements = { 'CREATE TABLE b (y TEXT)' } },
+}
+
+applied = inst:migrate(MIGRATIONS)
+ok(applied == 2, 'both versions applied on a fresh database')
+
+local i_a1 = index_of(h, 'CREATE TABLE a (x INTEGER)')
+local i_a2 = index_of(h, 'CREATE INDEX ai ON a (x)')
+local i_b  = index_of(h, 'CREATE TABLE b (y TEXT)')
+local i_rec = index_of(h, RECORD)
+ok(i_a1 < i_a2, 'statements run in the order the version lists them')
+ok(i_a2 < i_rec, 'version row LAST: it follows every statement of its version')
+ok(i_rec < i_b, 'a version is recorded before the next version starts')
+ok(execs_of(h, RECORD) == 2, 'one version row per applied version')
+ok(h.versions[1] == 1 and h.versions[2] == 2, 'the versions recorded are 1 then 2')
+
+-- applied_at is the injected clock, in whole seconds, read once per version.
+local rec_binds = {}
+for _, e in ipairs(h.log) do if e.sql == RECORD then rec_binds[#rec_binds + 1] = e.binds end end
+ok(rec_binds[1][1] == 1 and rec_binds[1][2] == 1700000123,
+   'the version row binds (version, now()) -- applied_at is the injected clock')
+ok(c.calls == 2, 'the clock is consulted once per applied version and not otherwise')
+
+-- --------------------------------------------------------- the done set
+
+c.t = 1700009999
+applied = inst:migrate(MIGRATIONS)
+ok(applied == 0, 'a second run over the same handle applies nothing')
+ok(execs_of(h, 'CREATE TABLE a (x INTEGER)') == 1,
+   'an already-recorded version runs none of its statements again')
+ok(execs_of(h, RECORD) == 2, 'and writes no second version row')
+ok(c.calls == 2, 'and does not consult the clock')
+
+-- A third version added to the list later is the only one that runs.
+local MORE = {
+  MIGRATIONS[1], MIGRATIONS[2],
+  { version = 3, statements = { 'ALTER TABLE b ADD COLUMN z INTEGER' } },
+}
+applied = inst:migrate(MORE)
+ok(applied == 1 and h.versions[3] == 3, 'only the new version is applied')
+ok(rec_binds[1][2] == 1700000123 and execs_of(h, RECORD) == 3,
+   'the earlier version rows keep the applied_at they were written with')
+
+-- ------------------------------------------------- soft and hard statements
+
+-- A soft statement that raises is swallowed; the list continues and the
+-- version is still recorded. This is the ALTER-on-a-re-run case.
+local raising = 'ALTER TABLE a ADD COLUMN dup INTEGER'
+h = connector(function(sql)
+  if sql == raising then return 'duplicate column name: dup' end
+end)
+c = clock()
+inst = M.new{ db = h, now = c.now }
+
+applied = inst:migrate({
+  { version = 1, statements = {
+      { soft = raising },
+      'SELECT dup FROM a LIMIT 0',
+  } },
+})
+ok(applied == 1, 'a soft statement that raises does not stop the version')
+ok(index_of(h, 'SELECT dup FROM a LIMIT 0') ~= nil,
+   'the hard statement after the soft one still runs')
+ok(index_of(h, raising) < index_of(h, 'SELECT dup FROM a LIMIT 0'),
+   'and runs after it, which is the whole point of the pairing')
+ok(h.versions[1] == 1, 'the version is recorded once its statements are through')
+ok(h.try_execs == 0,
+   'soft is pcall(db.exec, ...) and never try_exec -- a deliberate choice, not an accident')
+
+-- The discipline earning its keep: the soft ALTER failed because the TABLE
+-- was missing, and the hard statement naming the column turns a silently
+-- skipped migration into a loud one.
+h = connector(function(sql)
+  if sql:find('ALTER TABLE', 1, true) then return 'no such table: b' end
+  if sql:find('SELECT z FROM b', 1, true) then return 'no such column: z' end
+end)
+c = clock()
+inst = M.new{ db = h, now = c.now }
+
+local ran, why = pcall(function()
+  return inst:migrate({
+    { version = 1, statements = {
+        { soft = 'ALTER TABLE b ADD COLUMN z INTEGER' },
+        'SELECT z FROM b LIMIT 0',
+    } },
+  })
+end)
+ok(not ran and tostring(why):find('no such column: z', 1, true) ~= nil,
+   'a skipped soft ALTER surfaces as the hard statement raising, not as silence')
+ok(execs_of(h, RECORD) == 0,
+   'version row LAST: a version that raised half way records nothing')
+ok(#h.versions == 0, 'so the database still says that version was never applied')
+ok(c.calls == 0, 'and applied_at was never even asked for')
+
+-- CARRIED-OVER FOOTGUN, asserted so that it is a documented behaviour and
+-- not a surprise: a table statement whose `soft` key is absent or misspelled
+-- is pcall(db.exec, nil) -- swallowed, so the version applies NOTHING and is
+-- still recorded as done. The runner cannot tell that from a soft ALTER that
+-- legitimately failed. The discipline's answer is the same as everywhere
+-- else: follow it with a hard statement that names the columns.
+h = connector()
+inst = M.new{ db = h, now = clock().now }
+applied = inst:migrate({ { version = 1, statements = { { sofr = 'ALTER TABLE a ADD COLUMN z INTEGER' } } } })
+ok(applied == 1 and h.versions[1] == 1,
+   'a { soft = <absent> } statement is a silent no-op and the version is still recorded')
+ok(execs_of(h, RECORD) == 1 and #h.log == 4,
+   'the connector saw the swallowed nil exec and nothing else')
+
+-- ------------------------------------------- convergence after a failure
+
+-- The same handle, with the failure fixed: the version re-runs from its
+-- FIRST statement, which is why recording the version last is what makes a
+-- re-run converge rather than skip the rest of a file it never finished.
+local broken = true
+h = connector(function(sql)
+  if broken and sql == 'CREATE INDEX ai ON a (x)' then return 'disk I/O error' end
+end)
+c = clock()
+inst = M.new{ db = h, now = c.now }
+
+ran = pcall(inst.migrate, inst, MIGRATIONS)
+ok(not ran, 'a hard statement that raises stops migrate()')
+ok(execs_of(h, 'CREATE TABLE a (x INTEGER)') == 1 and execs_of(h, RECORD) == 0,
+   'the first statement ran, the version row did not')
+ok(index_of(h, 'CREATE TABLE b (y TEXT)') == nil,
+   'and the next version was never started')
+
+broken = false
+applied = inst:migrate(MIGRATIONS)
+ok(applied == 2, 'the re-run applies both versions')
+ok(execs_of(h, 'CREATE TABLE a (x INTEGER)') == 2,
+   'version 1 re-runs its earlier statements -- this is what soft exists for')
+ok(h.versions[1] == 1 and h.versions[2] == 2, 'and both versions end up recorded')
+
+-- ------------------------------------------------------- pre-split, verbatim
+
+-- Statements are stored pre-split and are handed to the connector ONE per
+-- call, verbatim. A statement carrying a semicolon and a double dash inside
+-- a string literal is exactly what a runtime splitter cuts in half.
+local nasty = "INSERT INTO note (body) VALUES ('a; b -- c')"
+h = connector()
+inst = M.new{ db = h, now = clock().now }
+inst:migrate({ { version = 1, statements = { nasty, 'SELECT body FROM note LIMIT 0' } } })
+ok(index_of(h, nasty) ~= nil,
+   'a statement containing ; and -- inside a literal reaches the connector whole')
+ok(execs_of(h, nasty) == 1, 'and exactly once -- nothing here splits a blob')
+
+-- One statement per call, counted: bootstrap + 2 statements + the version row.
+ok(#h.log == 5, 'four execs and one query: the connector prepares one statement per call')
+
+-- ---------------------------------------------- statement kinds and refusals
+
+-- Anything that is neither a string nor a { soft = ... } table goes to the
+-- connector as a hard statement, exactly as the original else-branch did.
+h = connector(function(sql) if type(sql) ~= 'string' then return 'not a statement' end end)
+inst = M.new{ db = h, now = clock().now }
+ran, why = pcall(inst.migrate, inst, { { version = 1, statements = { 42 } } })
+ok(not ran and tostring(why):find('not a statement', 1, true) ~= nil,
+   'a non-statement is refused by the connector rather than by an invented check')
+
+h = connector()
+inst = M.new{ db = h, now = clock().now }
+ran, why = pcall(inst.migrate, inst, 'CREATE TABLE a (x INTEGER)')
+ok(not ran and tostring(why):find('migrations', 1, true) ~= nil,
+   'migrate() refuses a blob by name: the list is pre-split, never a string')
+
+ran, why = pcall(inst.migrate, inst, { { version = '1', statements = {} } })
+ok(not ran and tostring(why):find('migrations[1]', 1, true) ~= nil,
+   'a malformed entry names its index rather than binding a nil version later')
+
+-- -------------------------------------------------------- schema_version
+
+h = connector()
+inst = M.new{ db = h, now = clock().now }
+ok(inst:schema_version() == 0,
+   'the empty database answers 0, because MAX over no rows is NULL and COALESCE catches it')
+ok(index_of(h, CURRENT) ~= nil, 'and it asks the COALESCE(MAX(version), 0) question')
+
+inst:migrate(MIGRATIONS)
+ok(inst:schema_version() == 2, 'after migrating, the highest recorded version')
+
+-- ------------------------------------------------------ two instances
+
+local h1, h2 = connector(), connector()
+local c1, c2 = clock(1000), clock(2000)
+local i1, i2 = M.new{ db = h1, now = c1.now }, M.new{ db = h2, now = c2.now }
+i1:migrate(MIGRATIONS)
+i2:migrate({ { version = 7, statements = { 'CREATE TABLE q (n INTEGER)' } } })
+ok(#h1.versions == 2 and h2.versions[1] == 7,
+   'two instances over two handles do not see each others tables')
+ok(index_of(h1, 'CREATE TABLE q (n INTEGER)') == nil,
+   'and no statement crosses between them: there is no module-level state')
+ok(i1:schema_version() == 2 and i2:schema_version() == 7,
+   'each instance reads its own handle')
+
+-- ---------------------------------------------------------- rows_by_name
+
+local q = { cols = { 'id', 'name', 'created_at' },
+            rows = { { 1, 'alpha', 1700000000 }, { 2, 'beta', 1700000001 } } }
+local rows = M.rows_by_name(q)
+ok(#rows == 2, 'one map per row')
+ok(rows[1].id == 1 and rows[1].name == 'alpha' and rows[1].created_at == 1700000000,
+   'values are keyed by column name')
+ok(rows[2].name == 'beta', 'and the second row is its own map')
+
+-- The reason this exists: a reordered SELECT would silently swap two fields
+-- of the same type. Positionally, r[1] and r[3] are both integers.
+local swapped = { cols = { 'created_at', 'name', 'id' },
+                  rows = { { 1700000000, 'alpha', 1 } } }
+local sw = M.rows_by_name(swapped)[1]
+ok(sw.id == 1 and sw.created_at == 1700000000,
+   'reordering the SELECT moves the values with their names, not past them')
+
+ok(#M.rows_by_name({ cols = { 'id' }, rows = {} }) == 0,
+   'no rows is an empty array, not nil')
+
+-- A NULL column comes back as an ABSENT KEY, not as a nil-valued one -- the
+-- same absent-not-nil shape the connector demands on the write side, where a
+-- nil bind is refused outright and an optional column is left out of the
+-- statement instead.
+local withnull = { cols = { 'id', 'revoked_at', 'name' },
+                   rows = { { 5, nil, 'gamma' } } }
+local wn = M.rows_by_name(withnull)[1]
+ok(wn.id == 5 and wn.name == 'gamma',
+   'a nil in the middle of a row does not truncate the map')
+ok(wn.revoked_at == nil and next(wn) ~= nil,
+   'and the NULL column is simply absent, which is what `if r.revoked_at` reads')
+
+-- Columns the result does not carry are absent rather than invented.
+local short = { cols = { 'a', 'b' }, rows = { { 1 } } }
+ok(M.rows_by_name(short)[1].b == nil, 'a column with no value is absent')
+
+-- ----------------------------------------------------------- like_escape
+
+ok(M.like_escape('plain') == 'plain', 'a term with no wildcards is unchanged')
+ok(M.like_escape('_') == '\\_', 'the underscore -- the one that made search read as broken')
+ok(M.like_escape('%') == '\\%', 'the percent')
+ok(M.like_escape('\\') == '\\\\', 'and the escape character itself')
+ok(M.like_escape('a%b_c\\d') == 'a\\%b\\_c\\\\d', 'all three in one term')
+ok(('%' .. M.like_escape('_') .. '%') == '%\\_%',
+   'wrapped for a contains-search, the customer term is inert and the wrapper is not')
+ok(select('#', M.like_escape('a_b')) == 1,
+   'exactly one return value: gsub second result would become a stray bind')
+ok(M.like_escape('%') == M.LIKE_ESCAPE_CHAR .. '%',
+   'LIKE_ESCAPE_CHAR is the character the escaper uses, so the ESCAPE clause cannot drift')
+ok(#M.LIKE_ESCAPE_CHAR == 1, 'and it is one character, the one that goes in ESCAPE \'\\\'')
+
+print(fails == 0 and "PASS" or ("FAIL " .. fails))
